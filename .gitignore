@@ -1,0 +1,77 @@
+# Dependencies
+node_modules/
+*/node_modules/
+
+# Production builds
+build/
+dist/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Keep example
+!.env.example
+
+# Logs
+*.log
+logs/
+server/logs/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Database
+*.db
+*.sqlite3
+
+# Redis dump
+dump.rdb
+
+# Docker
+.dockerignore
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+
+# Documentation (generated)
+*.md
+!README.md
+
+# Production configs
+docker-compose.prod.yml

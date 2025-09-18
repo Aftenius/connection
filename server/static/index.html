@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecureVoice - Тест</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #111827;
+            color: white;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+        }
+        .card {
+            background: #1f2937;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 20px;
+        }
+        .btn {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 8px;
+        }
+        .btn:hover {
+            background: #1d4ed8;
+        }
+        .input {
+            background: #374151;
+            border: 1px solid #4b5563;
+            color: white;
+            padding: 12px;
+            border-radius: 8px;
+            width: 100%;
+            margin: 8px 0;
+        }
+        .status {
+            padding: 12px;
+            border-radius: 8px;
+            margin: 8px 0;
+        }
+        .success { background: #065f46; }
+        .error { background: #7f1d1d; }
+        .info { background: #1e3a8a; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🎤 SecureVoice</h1>
+            <p>Защищенное голосовое общение для команд</p>
+        </div>
+
+        <div class="card">
+            <h2>Создать комнату</h2>
+            <input type="text" id="roomName" class="input" placeholder="Название комнаты">
+            <button onclick="createRoom()" class="btn">Создать комнату</button>
+            <div id="createStatus"></div>
+        </div>
+
+        <div class="card">
+            <h2>Присоединиться к комнате</h2>
+            <input type="text" id="roomId" class="input" placeholder="ID комнаты">
+            <input type="text" id="userName" class="input" placeholder="Ваше имя">
+            <button onclick="joinRoom()" class="btn">Присоединиться</button>
+            <div id="joinStatus"></div>
+        </div>
+
+        <div class="card">
+            <h2>Список комнат</h2>
+            <button onclick="loadRooms()" class="btn">Обновить список</button>
+            <div id="roomsList"></div>
+        </div>
+
+        <div class="card">
+            <h2>WebSocket Тест</h2>
+            <button onclick="testWebSocket()" class="btn">Тест соединения</button>
+            <div id="wsStatus"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000/api';
+        let currentRoom = null;
+        let ws = null;
+
+        function showStatus(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            element.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+
+        async function createRoom() {
+            const roomName = document.getElementById('roomName').value;
+            if (!roomName) {
+                showStatus('createStatus', 'Введите название комнаты', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/rooms`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        name: roomName,
+                        password: null,
+                        max_participants: 10
+                    })
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    currentRoom = data;
+                    showStatus('createStatus', `Комната создана! ID: ${data.room_id}`, 'success');
+                    document.getElementById('roomId').value = data.room_id;
+                } else {
+                    showStatus('createStatus', `Ошибка: ${data.detail}`, 'error');
+                }
+            } catch (error) {
+                showStatus('createStatus', `Ошибка: ${error.message}`, 'error');
+            }
+        }
+
+        async function joinRoom() {
+            const roomId = document.getElementById('roomId').value;
+            const userName = document.getElementById('userName').value;
+            
+            if (!roomId || !userName) {
+                showStatus('joinStatus', 'Введите ID комнаты и ваше имя', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`${API_BASE}/rooms/${roomId}/join`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        name: userName,
+                        password: null
+                    })
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    currentRoom = data.room;
+                    showStatus('joinStatus', `Присоединились к комнате: ${data.room.name}`, 'success');
+                    connectWebSocket(roomId, data.user.id);
+                } else {
+                    showStatus('joinStatus', `Ошибка: ${data.detail}`, 'error');
+                }
+            } catch (error) {
+                showStatus('joinStatus', `Ошибка: ${error.message}`, 'error');
+            }
+        }
+
+        async function loadRooms() {
+            try {
+                const response = await fetch(`${API_BASE}/rooms`);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    const roomsList = document.getElementById('roomsList');
+                    if (data.rooms.length === 0) {
+                        roomsList.innerHTML = '<div class="status info">Нет активных комнат</div>';
+                    } else {
+                        roomsList.innerHTML = data.rooms.map(room => `
+                            <div class="card" style="margin: 8px 0; padding: 16px;">
+                                <h3>${room.name}</h3>
+                                <p>ID: ${room.id}</p>
+                                <p>Участников: ${room.participants.length}</p>
+                                <p>Статус: ${room.is_active ? 'Активна' : 'Неактивна'}</p>
+                            </div>
+                        `).join('');
+                    }
+                } else {
+                    showStatus('roomsList', `Ошибка загрузки комнат: ${data.detail}`, 'error');
+                }
+            } catch (error) {
+                showStatus('roomsList', `Ошибка: ${error.message}`, 'error');
+            }
+        }
+
+        function connectWebSocket(roomId, userId) {
+            if (ws) {
+                ws.close();
+            }
+
+            ws = new WebSocket(`ws://localhost:8000/ws/${roomId}/${userId}`);
+            
+            ws.onopen = () => {
+                showStatus('wsStatus', 'WebSocket соединение установлено', 'success');
+            };
+
+            ws.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                showStatus('wsStatus', `Получено сообщение: ${message.type}`, 'info');
+            };
+
+            ws.onclose = () => {
+                showStatus('wsStatus', 'WebSocket соединение закрыто', 'error');
+            };
+
+            ws.onerror = (error) => {
+                showStatus('wsStatus', `WebSocket ошибка: ${error}`, 'error');
+            };
+        }
+
+        function testWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+                showStatus('wsStatus', 'Отправлен ping', 'info');
+            } else {
+                showStatus('wsStatus', 'WebSocket не подключен', 'error');
+            }
+        }
+
+        // Загружаем комнаты при загрузке страницы
+        window.onload = () => {
+            loadRooms();
+        };
+    </script>
+</body>
+</html>
+

@@ -1,0 +1,71 @@
+services:
+  # Redis for session and room storage
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - securevoice-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+
+  # Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf.d:/etc/nginx/conf.d
+    depends_on:
+      - server
+      - client
+    networks:
+      - securevoice-network
+    restart: unless-stopped
+
+  # Backend сервер
+  server:
+    build: ./server
+    ports:
+      - "0.0.0.0:8000:8000"
+    volumes:
+      - ./server:/app
+      - ./server/logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOST=0.0.0.0
+      - PORT=8000
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    networks:
+      - securevoice-network
+    restart: unless-stopped
+
+  # Frontend клиент
+  client:
+    build: ./client
+    ports:
+      - "0.0.0.0:3000:3000"
+    volumes:
+      - ./client:/app
+      - /app/node_modules
+    environment:
+      - REACT_APP_API_URL=http://192.168.127.134:8000
+      - CHOKIDAR_USEPOLLING=true
+    depends_on:
+      - server
+    networks:
+      - securevoice-network
+    restart: unless-stopped
+
+networks:
+  securevoice-network:
+    driver: bridge
+
+volumes:
+  redis_data:

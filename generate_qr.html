@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QR-код для SecureVoice</title>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .container {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 30px;
+            border-radius: 20px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+            max-width: 500px;
+            margin: 0 auto;
+        }
+        h1 {
+            margin-bottom: 20px;
+            font-size: 2.5em;
+        }
+        .url {
+            font-size: 1.2em;
+            margin: 20px 0;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            word-break: break-all;
+        }
+        #qrcode {
+            margin: 20px 0;
+        }
+        .instructions {
+            text-align: left;
+            margin-top: 20px;
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            border-radius: 10px;
+        }
+        .instructions h3 {
+            margin-top: 0;
+        }
+        .instructions ol {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .instructions li {
+            margin: 5px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎤 SecureVoice</h1>
+        <p>QR-код для быстрого доступа</p>
+        
+        <div class="url" id="url">http://192.168.127.134:3000</div>
+        
+        <div id="qrcode"></div>
+        
+        <div class="instructions">
+            <h3>📱 Как использовать:</h3>
+            <ol>
+                <li>Отсканируйте QR-код камерой телефона</li>
+                <li>Или скопируйте ссылку выше</li>
+                <li>Откройте в браузере</li>
+                <li>Введите ваше имя</li>
+                <li>Создайте комнату или присоединитесь к существующей</li>
+            </ol>
+            
+            <h3>🌐 Для компьютера:</h3>
+            <p>Просто откройте ссылку в браузере: <strong>http://192.168.127.134:3000</strong></p>
+        </div>
+    </div>
+
+    <script>
+        const url = 'http://192.168.127.134:3000';
+        
+        QRCode.toCanvas(document.getElementById('qrcode'), url, {
+            width: 200,
+            height: 200,
+            color: {
+                dark: '#000000',
+                light: '#FFFFFF'
+            }
+        }, function (error) {
+            if (error) console.error(error);
+            console.log('QR-код создан!');
+        });
+    </script>
+</body>
+</html>

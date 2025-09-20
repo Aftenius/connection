@@ -108,7 +108,24 @@ class RedisManager:
     
     async def add_participant(self, room_id: str, user_data: dict):
         """Добавить участника в комнату"""
-        await self.redis.hset(f"room_participants:{room_id}", user_data['id'], json.dumps(user_data))
+        participant_id = user_data.get('id') or user_data.get('user_id')
+        if not participant_id:
+            raise ValueError("Participant data must include 'id' or 'user_id'")
+
+        normalized_data = user_data.copy()
+        normalized_data['id'] = participant_id
+        normalized_data['user_id'] = participant_id
+
+        if not normalized_data.get('name'):
+            normalized_data['name'] = f"Участник {participant_id[:8]}"
+
+        normalized_data.setdefault('joined_at', time.time())
+
+        await self.redis.hset(
+            f"room_participants:{room_id}",
+            participant_id,
+            json.dumps(normalized_data)
+        )
     
     async def remove_participant(self, room_id: str, user_id: str):
         """Удалить участника из комнаты"""

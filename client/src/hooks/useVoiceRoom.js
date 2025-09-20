@@ -67,6 +67,7 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
   const peerConnections = useRef(new Map());
   const makingOfferRef = useRef(new Map());
   const pendingCandidates = useRef(new Map());
+  const pendingMessagesRef = useRef([]);
   const callTimerRef = useRef(null);
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
@@ -107,11 +108,44 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     setIsSpeaking(false);
   }, []);
 
-  const sendWebSocketMessage = useCallback((payload) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(payload));
+  const flushPendingMessages = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || pendingMessagesRef.current.length === 0) {
+      return;
     }
+
+    const queued = [...pendingMessagesRef.current];
+    pendingMessagesRef.current = [];
+
+    queued.forEach((message) => {
+      try {
+        ws.send(JSON.stringify(message));
+      } catch (error) {
+        console.warn('useVoiceRoom: Не удалось отправить отложенное сообщение', error);
+      }
+    });
   }, []);
+
+  const sendWebSocketMessage = useCallback(
+    (payload) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        flushPendingMessages();
+
+        try {
+          ws.send(JSON.stringify(payload));
+          return true;
+        } catch (error) {
+          console.warn('useVoiceRoom: Ошибка отправки сообщения по WebSocket', error);
+          return false;
+        }
+      }
+
+      pendingMessagesRef.current.push(payload);
+      return false;
+    },
+    [flushPendingMessages]
+  );
 
   const updateSpeakingState = useCallback((speaking) => {
     setIsSpeaking(speaking);
@@ -570,12 +604,25 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     ws.onopen = () => {
       setError(null);
       if (currentUserId) {
-        ws.send(JSON.stringify({
-          type: 'user_joined',
-          user_id: currentUserId,
-          user_name: currentUser?.name
-        }));
+        try {
+          ws.send(
+            JSON.stringify({
+              type: 'user_joined',
+              user_id: currentUserId,
+              user_name: currentUser?.name
+            })
+          );
+        } catch (sendError) {
+          console.warn('useVoiceRoom: Не удалось отправить событие user_joined', sendError);
+          pendingMessagesRef.current.push({
+            type: 'user_joined',
+            user_id: currentUserId,
+            user_name: currentUser?.name
+          });
+        }
       }
+
+      flushPendingMessages();
     };
 
     ws.onmessage = (event) => {
@@ -588,8 +635,9 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
 
     ws.onclose = () => {
       wsRef.current = null;
+      pendingMessagesRef.current = [];
     };
-  }, [apiOrigin, currentUser?.name, currentUserId, handleWebSocketMessage, roomId]);
+  }, [apiOrigin, currentUser?.name, currentUserId, flushPendingMessages, handleWebSocketMessage, roomId]);
 
   const fetchParticipants = useCallback(async () => {
     if (!roomId) {
@@ -675,6 +723,7 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     setIsInCall(false);
     setCallDuration(0);
     setError(null);
+    pendingMessagesRef.current = [];
   }, [localStream, resetSpeakingAnalysis]);
 
   const toggleMute = useCallback(() => {

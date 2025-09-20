@@ -906,51 +906,42 @@ async def notify_room_deleted(room_id: str):
 
 # === ПЕРИОДИЧЕСКИЕ ЗАДАЧИ ===
 
-async def cleanup_task():
+async def cleanup_rooms_task():
     """Периодическая очистка истекших комнат"""
     while True:
         try:
             await redis_manager.cleanup_expired_rooms()
             await asyncio.sleep(3600)  # Каждый час
         except Exception as e:
-            logger.error(f"Ошибка в cleanup_task: {e}")
+            logger.error(f"Ошибка в cleanup_rooms_task: {e}")
             await asyncio.sleep(60)
 
-@app.on_event("startup")
-async def startup_event():
-    """Запуск фоновых задач"""
-    asyncio.create_task(cleanup_task())
-    logger.info("SecureVoice Server v2 запущен")
 
-# Статические файлы
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Запуск периодической очистки неактивных пользователей
-import asyncio
-import threading
-
-async def cleanup_task():
+async def cleanup_inactive_users_task():
     """Задача периодической очистки неактивных пользователей"""
     while True:
         try:
             await cleanup_inactive_users()
-            await asyncio.sleep(60)  # Проверяем каждую минуту
+            await asyncio.sleep(60)
         except Exception as e:
-            logger.error(f"Ошибка в задаче очистки: {e}")
+            logger.error(f"Ошибка в cleanup_inactive_users_task: {e}")
             await asyncio.sleep(60)
 
-def run_cleanup_task():
-    """Запуск задачи очистки в отдельном потоке"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(cleanup_task())
+
+@app.on_event("startup")
+async def startup_event():
+    """Запуск фоновых задач"""
+    asyncio.create_task(cleanup_rooms_task())
+    asyncio.create_task(cleanup_inactive_users_task())
+    logger.info("SecureVoice Server v2 запущен")
+
+
+# Статические файлы
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # Запускаем задачу очистки в отдельном потоке
-    cleanup_thread = threading.Thread(target=run_cleanup_task, daemon=True)
-    cleanup_thread.start()
-    
+
     logger.info("Запуск сервера SecureVoice v2 на порту 8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

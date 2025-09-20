@@ -33,6 +33,19 @@ const normalizeParticipant = (participant, fallbackId) => {
     return null;
   }
 
+  let status = data.status || data.connection_status || 'connected';
+  if (typeof status === 'string') {
+    status = status.toLowerCase();
+  }
+
+  if (status && status !== 'connected') {
+    if (fallbackId && participantId === fallbackId) {
+      status = 'connected';
+    } else {
+      return null;
+    }
+  }
+
   const name =
     data.name ||
     data.user_name ||
@@ -45,7 +58,8 @@ const normalizeParticipant = (participant, fallbackId) => {
     name,
     is_creator: Boolean(data.is_creator),
     is_speaking: Boolean(data.is_speaking),
-    joined_at: data.joined_at || Date.now()
+    joined_at: data.joined_at || Date.now(),
+    status: status || 'connected'
   };
 };
 
@@ -74,6 +88,7 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
   const analyserDataRef = useRef(null);
   const animationFrameRef = useRef(null);
   const lastSpeakingStateRef = useRef(false);
+  const intentionalLeaveRef = useRef(false);
 
   const apiOrigin = useMemo(() => {
     const raw = process.env.REACT_APP_API_URL || window.location.origin;
@@ -473,7 +488,8 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     }
   }, []);
 
-  const applyParticipants = useCallback((incoming = []) => {
+  const applyParticipants = useCallback((incoming = [], options = {}) => {
+    const { replace = false } = options;
     const normalized = incoming
       .map((participant) => normalizeParticipant(participant))
       .filter(Boolean);
@@ -481,24 +497,86 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     setParticipants((prev) => {
       const map = new Map();
 
-      normalized.forEach((participant) => {
-        map.set(participant.id, participant);
-      });
+      if (!replace) {
+        prev.forEach((participant) => {
+          if (participant?.id) {
+            map.set(participant.id, participant);
+          }
+        });
+      }
 
-      prev.forEach((participant) => {
-        if (!map.has(participant.id)) {
-          map.set(participant.id, participant);
+      normalized.forEach((participant) => {
+        if (!participant?.id) {
+          return;
         }
+
+        const existing = map.get(participant.id) || {};
+        map.set(participant.id, { ...existing, ...participant });
       });
 
       if (currentUserId) {
         const normalizedCurrent = normalizeParticipant(currentUser, currentUserId);
         if (normalizedCurrent) {
-          map.set(currentUserId, normalizedCurrent);
+          const existing = map.get(currentUserId) || {};
+          map.set(currentUserId, { ...existing, ...normalizedCurrent });
         }
       }
 
-      return Array.from(map.values());
+      const nextParticipants = Array.from(map.values()).filter(Boolean);
+
+      if (replace) {
+        nextParticipants.sort((a, b) => {
+          const joinedA = a.joined_at || 0;
+          const joinedB = b.joined_at || 0;
+
+          if (joinedA === joinedB) {
+            return String(a.id).localeCompare(String(b.id));
+          }
+
+          return joinedA - joinedB;
+        });
+      }
+
+      if (replace) {
+        setSpeakingUsers(() => {
+          const speaking = new Set();
+          nextParticipants.forEach((participant) => {
+            if (participant.is_speaking) {
+              speaking.add(participant.id);
+            }
+          });
+          return speaking;
+        });
+      } else if (normalized.length) {
+        setSpeakingUsers((prevSpeaking) => {
+          const speaking = new Set(prevSpeaking);
+
+          normalized.forEach((participant) => {
+            if (!participant?.id) {
+              return;
+            }
+
+            if (participant.is_speaking) {
+              speaking.add(participant.id);
+            } else {
+              speaking.delete(participant.id);
+            }
+          });
+
+          for (const id of speaking) {
+            const found = nextParticipants.find(
+              (participant) => participant.id === id && participant.is_speaking
+            );
+            if (!found) {
+              speaking.delete(id);
+            }
+          }
+
+          return speaking;
+        });
+      }
+
+      return nextParticipants;
     });
   }, [currentUser, currentUserId]);
 
@@ -553,7 +631,7 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     switch (message.type) {
       case 'participants_update':
         if (Array.isArray(message.participants)) {
-          applyParticipants(message.participants);
+          applyParticipants(message.participants, { replace: true });
         }
         break;
       case 'user_joined':
@@ -631,13 +709,43 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
 
     ws.onerror = (event) => {
       console.error('useVoiceRoom: Ошибка WebSocket', event);
+      if (!intentionalLeaveRef.current) {
+        setError('Возникла проблема с подключением к комнате. Пытаемся переподключиться…');
+      }
     };
 
     ws.onclose = () => {
       wsRef.current = null;
       pendingMessagesRef.current = [];
+      if (intentionalLeaveRef.current) {
+        return;
+      }
+
+      peerConnections.current.forEach((_, peerId) => {
+        closePeerConnection(peerId);
+      });
+
+      setRemoteStreams(new Map());
+      setSpeakingUsers(new Set());
+      setIsInRoom(false);
+      setIsConnecting(false);
+      if (callTimerRef.current) {
+        clearInterval(callTimerRef.current);
+        callTimerRef.current = null;
+      }
+      setIsInCall(false);
+      setCallDuration(0);
+      setError('Соединение с комнатой потеряно. Пытаемся переподключиться…');
     };
-  }, [apiOrigin, currentUser?.name, currentUserId, flushPendingMessages, handleWebSocketMessage, roomId]);
+  }, [
+    apiOrigin,
+    closePeerConnection,
+    currentUser?.name,
+    currentUserId,
+    flushPendingMessages,
+    handleWebSocketMessage,
+    roomId
+  ]);
 
   const fetchParticipants = useCallback(async () => {
     if (!roomId) {
@@ -654,17 +762,24 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     return participantsData.map((participant) => normalizeParticipant(participant)).filter(Boolean);
   }, [apiOrigin, roomId]);
 
-  const joinRoom = useCallback(async () => {
+  const joinRoom = useCallback(async (options = {}) => {
     if (!roomId || !currentUserId || !isAuthenticated || isInRoom || isConnecting) {
       return;
     }
 
+    const { force = false } = options;
+
+    if (intentionalLeaveRef.current && !force) {
+      return;
+    }
+
+    intentionalLeaveRef.current = false;
     setIsConnecting(true);
 
     try {
       await ensureLocalStream();
       const existingParticipants = await fetchParticipants();
-      applyParticipants(existingParticipants);
+      applyParticipants(existingParticipants, { replace: true });
       connectWebSocket(currentUserId);
       setIsInRoom(true);
     } catch (joinError) {
@@ -687,6 +802,8 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
   ]);
 
   const leaveRoom = useCallback(() => {
+    intentionalLeaveRef.current = true;
+
     peerConnections.current.forEach((pc, peerId) => {
       try {
         pc.close();

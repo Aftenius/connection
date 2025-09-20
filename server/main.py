@@ -608,7 +608,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     if not room_data:
         await websocket.close(code=4004, reason="Room not found")
         return
-    
+
+    participant_registered = False
+    connection_registered = False
+
     existing_participants = await redis_manager.get_participants(room_id)
     participant_data = None
 
@@ -640,6 +643,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     participant_data["is_creator"] = participant_data.get("is_creator", room_data.get("creator_id") == user_id)
 
     await redis_manager.add_participant(room_id, participant_data)
+    participant_registered = True
     logger.info(f"✅ Участник {participant_data['id']} зарегистрирован в комнате {room_id}")
     
     if room_id not in active_connections:
@@ -650,6 +654,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     
     active_connections[room_id].append(websocket)
     user_connections[room_id][user_id] = websocket
+    connection_registered = True
     
     # Добавляем в активные соединения Redis
     await redis_manager.add_active_connection(room_id, user_id, {"status": "connected"})
@@ -695,25 +700,31 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
                 
     except WebSocketDisconnect:
         logger.info(f"WebSocket отключение: пользователь {user_id} покинул комнату {room_id}")
-        
-        # Удаляем соединение
-        if room_id in active_connections:
-            if websocket in active_connections[room_id]:
+    except Exception as exc:
+        logger.exception(
+            "Ошибка обработки WebSocket соединения %s в комнате %s",
+            user_id,
+            room_id,
+            exc_info=exc
+        )
+    finally:
+        if connection_registered:
+            if room_id in active_connections and websocket in active_connections[room_id]:
                 active_connections[room_id].remove(websocket)
-            if not active_connections[room_id]:
-                del active_connections[room_id]
-        
-        if room_id in user_connections:
-            if user_id in user_connections[room_id]:
+                if not active_connections[room_id]:
+                    del active_connections[room_id]
+
+            if room_id in user_connections and user_id in user_connections[room_id]:
                 del user_connections[room_id][user_id]
-            if not user_connections[room_id]:
-                del user_connections[room_id]
-        
-        # Удаляем из активных соединений Redis
-        await redis_manager.remove_active_connection(room_id, user_id)
-        
-        # Уведомляем остальных участников
-        await notify_user_left(room_id, user_id)
+                if not user_connections[room_id]:
+                    del user_connections[room_id]
+
+            await redis_manager.remove_active_connection(room_id, user_id)
+
+        if participant_registered:
+            await redis_manager.remove_participant(room_id, user_id)
+            await notify_user_left(room_id, user_id)
+            await send_participants_update(room_id)
 
 # === HELPER FUNCTIONS ===
 
@@ -736,6 +747,21 @@ async def broadcast_to_all(room_id: str, message: dict):
                 await connection.send_text(message_str)
             except:
                 active_connections[room_id].remove(connection)
+
+async def send_participants_update(room_id: str):
+    """Рассылает актуальный список участников всем подключенным клиентам"""
+    raw_participants = await redis_manager.get_participants(room_id)
+    participants: List[dict] = []
+
+    for stored_participant in raw_participants:
+        normalized = normalize_participant(stored_participant)
+        if normalized:
+            participants.append(normalized)
+
+    await broadcast_to_all(room_id, {
+        "type": "participants_update",
+        "participants": participants
+    })
 
 def normalize_participant(participant: Optional[dict], fallback_id: Optional[str] = None) -> Optional[dict]:
     """Привести данные участника к единому формату"""

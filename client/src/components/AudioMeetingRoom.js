@@ -71,8 +71,13 @@ const AudioMeetingRoom = ({ title = 'Аудио-встреча' }) => {
       const stream = remoteStreams.get(userId);
       if (stream && element.srcObject !== stream) {
         element.srcObject = stream;
+        const playPromise = element.play?.();
+        if (playPromise?.catch) {
+          playPromise.catch(() => {});
+        }
       }
       element.volume = isSpeakerOn ? 1 : 0;
+      element.muted = false;
     },
     [isSpeakerOn, remoteStreams]
   );
@@ -162,12 +167,17 @@ const AudioMeetingRoom = ({ title = 'Аудио-встреча' }) => {
       const audioElement = remoteAudioRefs.current.get(userId);
       if (audioElement && audioElement.srcObject !== stream) {
         audioElement.srcObject = stream;
+        const playPromise = audioElement.play?.();
+        if (playPromise?.catch) {
+          playPromise.catch(() => {});
+        }
       }
     });
 
     remoteAudioRefs.current.forEach((audioElement, userId) => {
       if (!remoteStreams.has(userId) && audioElement.srcObject) {
         audioElement.srcObject = null;
+        audioElement.pause?.();
       }
     });
   }, [remoteStreams]);

@@ -136,21 +136,41 @@ async def create_or_get_session(request):
     }
     
     await redis_manager.save_user_session(user_id, session_data)
-    logger.info(f"Создана новая сессия для пользователя {name}")
+    logger.info(f"Создана новая сессия для пользователя {name} (ID: {user_id})")
+    
+    # Проверяем, что сессия сохранилась
+    saved_session = await redis_manager.get_user_session(user_id)
+    logger.info(f"Проверка сохранения сессии: {saved_session is not None}")
+    if saved_session:
+        logger.info(f"Сессия сохранена: user_id={user_id}, name={saved_session.get('name')}")
+    else:
+        logger.error(f"Сессия НЕ сохранена: user_id={user_id}")
     
     return {"session_token": user_id, "user": session_data}
 
 @app.post("/api/rooms")
 async def create_room(room_data: RoomCreate, request):
     """Создать новую комнату"""
-    # Получаем данные создателя из заголовков
-    session_token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not session_token:
-        raise HTTPException(status_code=401, detail="Session token required")
+    logger.info("🚀 ФУНКЦИЯ create_room ВЫЗВАНА!")
+    logger.info(f"📦 Данные комнаты: {room_data}")
+    logger.info(f"🌐 Заголовки запроса: {dict(request.headers)}")
     
+    # Получаем данные создателя из заголовков
+    auth_header = request.headers.get("Authorization", "")
+    logger.info(f"🔍 Authorization header: '{auth_header}'")
+    session_token = auth_header.replace("Bearer ", "")
+    logger.info(f"🔍 Session token: '{session_token}'")
+    if not session_token:
+        logger.error(f"❌ Session token пуст!")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    
+    logger.info(f"🔍 Ищем сессию по токену: {session_token}")
     session = await redis_manager.get_user_session(session_token)
     if not session:
+        logger.error(f"❌ Сессия не найдена для токена: {session_token}")
         raise HTTPException(status_code=401, detail="Invalid session")
+    
+    logger.info(f"✅ Найдена сессия: {session}")
     
     room_id = str(uuid.uuid4())[:8]  # Короткий ID для удобства
     creator_id = session['user_id']

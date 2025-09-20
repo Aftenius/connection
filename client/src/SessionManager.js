@@ -16,6 +16,11 @@ class SessionManager {
         // Пытаемся восстановить существующую сессию
         const existingSession = this.getStoredSession();
         
+        // Восстанавливаем jwtToken если он есть в сохраненной сессии
+        if (existingSession && existingSession.jwt_token) {
+            this.jwtToken = existingSession.jwt_token;
+        }
+        
         const requestData = {
             name: name.trim(),
             session_token: existingSession?.session_token
@@ -38,10 +43,12 @@ class SessionManager {
             
             // Сохраняем сессию
             this.sessionToken = data.session_token;
+            this.jwtToken = data.jwt_token;
             this.userData = data.user;
             
             this.saveSession({
                 session_token: data.session_token,
+                jwt_token: data.jwt_token,
                 user: data.user,
                 saved_at: Date.now()
             });
@@ -97,6 +104,7 @@ class SessionManager {
         try {
             localStorage.removeItem(this.storageKey);
             this.sessionToken = null;
+            this.jwtToken = null;
             this.userData = null;
         } catch (error) {
             console.error('Ошибка очистки сессии:', error);
@@ -104,19 +112,29 @@ class SessionManager {
     }
 
     /**
-     * Получить заголовки для API запросов
+     * Получить JWT токен для авторизации
+     */
+    getJwtToken() {
+        return this.jwtToken;
+    }
+
+    /**
+     * Получить заголовки авторизации для API запросов
      */
     getAuthHeaders() {
-        if (this.sessionToken) {
-            return {
-                'Authorization': `Bearer ${this.sessionToken}`,
-                'Content-Type': 'application/json'
-            };
-        }
-        return {
+        const headers = {
             'Content-Type': 'application/json'
         };
+        
+        if (this.jwtToken) {
+            headers['Authorization'] = `Bearer ${this.jwtToken}`;
+        } else if (this.sessionToken) {
+            headers['Authorization'] = `Bearer ${this.sessionToken}`;
+        }
+        
+        return headers;
     }
+
 
     /**
      * Проверить, авторизован ли пользователь
@@ -167,6 +185,28 @@ class SessionManager {
      */
     hasSavedSession() {
         return !!this.getStoredSession();
+    }
+
+    /**
+     * Проверить, есть ли действующая сессия
+     */
+    hasValidSession() {
+        const session = this.getStoredSession();
+        if (!session) return false;
+        
+        // Если есть сохраненная сессия, восстанавливаем данные
+        this.sessionToken = session.session_token;
+        this.jwtToken = session.jwt_token;
+        this.userData = session.user;
+        
+        return true;
+    }
+
+    /**
+     * Получить текущего пользователя
+     */
+    getCurrentUser() {
+        return this.userData;
     }
 
     /**

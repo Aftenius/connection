@@ -1,5 +1,5 @@
 """
-SecureVoice Backend v2 с Redis и системой сессий
+SecureVoice Backend v2 с Redis и системой сессий + JWT + Rate Limiting
 """
 import json
 import uuid
@@ -7,30 +7,61 @@ import logging
 import time
 import asyncio
 import hashlib
+import os
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Depends, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from redis_manager import redis_manager
 
 # Настройка логирования
+os.makedirs('logs', exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('logs/server.log'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+# JWT Configuration
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-jwt-key-change-in-production")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# JWT Bearer token scheme
+security = HTTPBearer()
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="SecureVoice API v2", version="2.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://client:3000", "http://192.168.127.134:3000"],
+    allow_origins=[
+        "http://localhost:3000", 
+        "http://client:3000", 
+        "http://192.168.127.134:3000",
+        "https://app.webnoir.ru",
+        "http://app.webnoir.ru"
+    ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -38,6 +69,7 @@ app.add_middleware(
 
 # Активные WebSocket соединения
 active_connections: Dict[str, List[WebSocket]] = {}
+user_connections: Dict[str, Dict[str, WebSocket]] = {}  # {room_id: {user_id: websocket}}
 
 # Pydantic модели
 class UserSession(BaseModel):
@@ -98,6 +130,48 @@ def generate_stable_user_id(name: str, ip: str, user_agent: str) -> str:
     hash_obj = hashlib.md5(data.encode('utf-8'))
     return hash_obj.hexdigest()
 
+# === JWT FUNCTIONS ===
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Создание JWT токена"""
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Проверка JWT токена"""
+    try:
+        token = credentials.credentials
+        logger.info(f"🔍 Проверяем JWT токен: {token[:20]}...")
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        logger.info(f"✅ JWT токен валиден, user_id: {user_id}")
+        if user_id is None:
+            logger.error("❌ JWT токен не содержит user_id")
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_id
+    except JWTError as e:
+        logger.error(f"❌ Ошибка JWT: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+async def get_current_user_optional(request: Request) -> Optional[str]:
+    """Получение текущего пользователя (опционально)"""
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None
+    
+    try:
+        token = auth_header.split(" ")[1]
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload.get("sub")
+    except:
+        return None
+
 # === MIDDLEWARE ===
 
 @app.middleware("http")
@@ -113,12 +187,14 @@ async def add_client_info(request, call_next):
 # === ENDPOINTS ===
 
 @app.get("/api/health")
-async def health_check():
+@limiter.limit("30/minute")
+async def health_check(request: Request):
     """Проверка здоровья сервера"""
     return {"status": "ok", "message": "SecureVoice API v2 is running"}
 
 @app.post("/api/session")
-async def create_or_get_session(request: Request):
+@limiter.limit("30/minute")
+async def create_or_get_session(request: Request, response: Response):
     """Создать или получить сессию пользователя"""
     data = await request.json()
     name = data.get("name", "").strip()
@@ -143,7 +219,20 @@ async def create_or_get_session(request: Request):
             session['name'] = name  # Обновляем имя на случай изменения
             await redis_manager.save_user_session(session_token, session)
             logger.info(f"Восстановлена сессия для пользователя {name} (ID: {stable_user_id[:8]})")
-            return {"session_token": session_token, "user": session}
+            # Создаем JWT токен для существующей сессии
+            jwt_token = create_access_token(data={"sub": session['user_id']})
+            
+            # Устанавливаем cookie для надежности
+            response.set_cookie(
+                key="securevoice_session",
+                value=session_token,
+                max_age=30 * 24 * 60 * 60,  # 30 дней
+                httponly=True,
+                secure=request.url.scheme == "https",
+                samesite="strict"
+            )
+            
+            return {"session_token": session_token, "jwt_token": jwt_token, "user": session}
     
     # Проверяем существующую сессию по стабильному ID
     existing_sessions = await redis_manager.find_session_by_stable_id(stable_user_id)
@@ -154,7 +243,20 @@ async def create_or_get_session(request: Request):
         session['name'] = name
         await redis_manager.save_user_session(session_token, session)
         logger.info(f"Найдена существующая сессия для пользователя {name} (ID: {stable_user_id[:8]})")
-        return {"session_token": session_token, "user": session}
+        # Создаем JWT токен для существующей сессии
+        jwt_token = create_access_token(data={"sub": session['user_id']})
+        
+        # Устанавливаем cookie для надежности
+        response.set_cookie(
+            key="securevoice_session",
+            value=session_token,
+            max_age=30 * 24 * 60 * 60,  # 30 дней
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="strict"
+        )
+        
+        return {"session_token": session_token, "jwt_token": jwt_token, "user": session}
     
     # Создаем новую сессию
     user_id = str(uuid.uuid4())
@@ -174,17 +276,55 @@ async def create_or_get_session(request: Request):
     await redis_manager.save_user_session(user_id, session_data)
     logger.info(f"Создана новая сессия для пользователя {name} (Hash: {user_hash}, ID: {stable_user_id[:8]})")
     
-    return {"session_token": user_id, "user": session_data}
+    # Создаем JWT токен для новой сессии
+    jwt_token = create_access_token(data={"sub": user_id})
+    
+    # Устанавливаем cookie для надежности
+    response.set_cookie(
+        key="securevoice_session",
+        value=user_id,
+        max_age=30 * 24 * 60 * 60,  # 30 дней
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict"
+    )
+    
+    return {"session_token": user_id, "jwt_token": jwt_token, "user": session_data}
+
+@app.get("/api/session/restore")
+@limiter.limit("60/minute")
+async def restore_session(request: Request, response: Response):
+    """Восстановить сессию по cookie"""
+    # Получаем session_token из cookie
+    session_token = request.cookies.get("securevoice_session")
+    
+    if not session_token:
+        raise HTTPException(status_code=401, detail="No session cookie found")
+    
+    # Получаем сессию из Redis
+    session = await redis_manager.get_user_session(session_token)
+    if not session:
+        # Удаляем недействительный cookie
+        response.delete_cookie("securevoice_session")
+        raise HTTPException(status_code=401, detail="Invalid session")
+    
+    # Обновляем время последнего визита
+    session['last_seen'] = time.time()
+    await redis_manager.save_user_session(session_token, session)
+    
+    # Создаем новый JWT токен
+    jwt_token = create_access_token(data={"sub": session['user_id']})
+    
+    logger.info(f"Восстановлена сессия по cookie для пользователя {session['name']} (ID: {session['user_id'][:8]})")
+    
+    return {"session_token": session_token, "jwt_token": jwt_token, "user": session}
 
 @app.post("/api/rooms")
-async def create_room(room_data: RoomCreate, request: Request):
+@limiter.limit("20/minute")
+async def create_room(room_data: RoomCreate, request: Request, user_id: str = Depends(verify_token)):
     """Создать новую комнату"""
-    # Получаем данные создателя из заголовков
-    session_token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not session_token:
-        raise HTTPException(status_code=401, detail="Session token required")
-    
-    session = await redis_manager.get_user_session(session_token)
+    # Получаем сессию пользователя через JWT
+    session = await redis_manager.get_user_session(user_id)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
     
@@ -256,16 +396,35 @@ async def get_room_info(room_id: str):
     return {"room": room}
 
 @app.post("/api/rooms/{room_id}/join")
+@limiter.limit("30/minute")
 async def join_room(room_id: str, user_data: UserJoin, request: Request):
     """Присоединиться к комнате"""
-    # Получаем сессию пользователя
-    session_token = user_data.session_token or request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not session_token:
-        raise HTTPException(status_code=401, detail="Session token required")
+    # Пытаемся получить JWT токен из заголовков (опционально)
+    user_id = None
+    session = None
     
-    session = await redis_manager.get_user_session(session_token)
+    try:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("sub")
+            if user_id:
+                session = await redis_manager.get_user_session(user_id)
+    except Exception:
+        pass  # Игнорируем ошибки JWT
+    
+    # Если нет сессии, создаем временную для гостя
     if not session:
-        raise HTTPException(status_code=401, detail="Invalid session")
+        user_id = f"guest_{uuid.uuid4().hex[:8]}"
+        session = {
+            'user_id': user_id,
+            'name': user_data.name or 'Гость',
+            'ip_address': request.client.host,
+            'created_at': time.time()
+        }
+        # Сохраняем временную сессию на 1 час
+        await redis_manager.save_user_session(user_id, session, 3600)
     
     # Проверяем существование комнаты
     room_data = await redis_manager.get_room(room_id)
@@ -277,7 +436,6 @@ async def join_room(room_id: str, user_data: UserJoin, request: Request):
         logger.warning(f"Неверный пароль для комнаты {room_id}")
         raise HTTPException(status_code=401, detail="Invalid password")
     
-    user_id = session['user_id']
     user_name = user_data.name if user_data.name.strip() else session['name']
     
     # Проверяем, не является ли пользователь уже участником
@@ -294,60 +452,39 @@ async def join_room(room_id: str, user_data: UserJoin, request: Request):
         id=user_id,
         name=user_name,
         ip_address=session.get('ip_address', ''),
-        is_creator=user_id == room_data['creator_id'],
+        is_creator=user_id == room_data.get('creator_id'),
         joined_at=time.time()
     )
     
     # Проверяем, нужно ли добавлять в зал ожидания
     participants = await redis_manager.get_participants(room_id)
-    is_creator = user_id == room_data['creator_id']
+    is_creator = user_id == room_data.get('creator_id')
     
-    if is_creator:
-        # Создатель может присоединиться сразу
-        await redis_manager.add_participant(room_id, user.model_dump())
-        logger.info(f"Создатель {user_name} присоединился к комнате {room_id}")
-        
-        # Уведомляем других участников
-        await notify_user_joined(room_id, user.model_dump())
-        
-        room_data['participants'] = await redis_manager.get_participants(room_id)
-        return {"user": user.model_dump(), "room": room_data, "in_waiting_room": False}
-    
-    elif room_data['has_waiting_room']:
-        # Все остальные идут в зал ожидания для одобрения
-        await redis_manager.add_join_request(room_id, user.model_dump())
-        logger.info(f"Пользователь {user_name} добавлен в запросы на подключение к комнате {room_id}")
-        
-        # Уведомляем создателя о новом запросе
-        await notify_creator_about_request(room_id, user.model_dump())
-        
-        return {"user": user.model_dump(), "room": room_data, "in_waiting_room": True, "awaiting_approval": True}
-    
-    elif len(participants) >= room_data['max_participants']:
-        # Если нет зала ожидания и комната полная
+    # Упрощенная логика - любой пользователь присоединяется сразу
+    if len(participants) >= room_data.get('max_participants', 10):
+        # Если комната полная
         logger.warning(f"Комната {room_id} переполнена")
         raise HTTPException(status_code=400, detail="Room is full")
     
-    else:
-        # Добавляем участника сразу
-        await redis_manager.add_participant(room_id, user.model_dump())
-        logger.info(f"Пользователь {user_name} присоединился к комнате {room_id}")
-        
-        # Уведомляем других участников
-        await notify_user_joined(room_id, user.model_dump())
-        
-        room_data['participants'] = await redis_manager.get_participants(room_id)
-        return {"user": user.model_dump(), "room": room_data, "in_waiting_room": False}
+    # Добавляем участника сразу
+    await redis_manager.add_participant(room_id, user.model_dump())
+    logger.info(f"Пользователь {user_name} присоединился к комнате {room_id}")
+    
+    # Уведомляем других участников
+    await notify_user_joined(room_id, user.model_dump())
+    
+    room_data['participants'] = await redis_manager.get_participants(room_id)
+    return {"user": user.model_dump(), "room": room_data, "in_waiting_room": False}
 
 @app.post("/api/rooms/{room_id}/approve")
-async def approve_user(room_id: str, request: Request):
+@limiter.limit("20/minute")
+async def approve_user(room_id: str, request: Request, user_id: str = Depends(verify_token)):
     """Одобрить пользователя (только для создателя)"""
     data = await request.json()
     user_id_to_approve = data.get("user_id")
     
-    # Получаем сессию текущего пользователя
-    session_token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    session = await redis_manager.get_user_session(session_token)
+    # Получаем сессию текущего пользователя через JWT
+    session = await redis_manager.get_user_session(user_id)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
     
@@ -379,14 +516,14 @@ async def approve_user(room_id: str, request: Request):
     return {"message": "User approved", "user": approved_user}
 
 @app.post("/api/rooms/{room_id}/reject")
-async def reject_user(room_id: str, request: Request):
+@limiter.limit("20/minute")
+async def reject_user(room_id: str, request: Request, user_id: str = Depends(verify_token)):
     """Отклонить пользователя (только для создателя)"""
     data = await request.json()
     user_id_to_reject = data.get("user_id")
     
-    # Получаем сессию текущего пользователя
-    session_token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    session = await redis_manager.get_user_session(session_token)
+    # Получаем сессию текущего пользователя через JWT
+    session = await redis_manager.get_user_session(user_id)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
     
@@ -406,11 +543,11 @@ async def reject_user(room_id: str, request: Request):
     return {"message": "User rejected"}
 
 @app.get("/api/rooms/{room_id}/requests")
-async def get_join_requests(room_id: str, request: Request):
+@limiter.limit("30/minute")
+async def get_join_requests(room_id: str, request: Request, user_id: str = Depends(verify_token)):
     """Получить список запросов на подключение (только для создателя)"""
-    # Получаем сессию текущего пользователя
-    session_token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    session = await redis_manager.get_user_session(session_token)
+    # Получаем сессию текущего пользователя через JWT
+    session = await redis_manager.get_user_session(user_id)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
     
@@ -423,11 +560,11 @@ async def get_join_requests(room_id: str, request: Request):
     return {"requests": requests}
 
 @app.delete("/api/rooms/{room_id}")
-async def delete_room(room_id: str, request: Request):
+@limiter.limit("10/minute")
+async def delete_room(room_id: str, request: Request, user_id: str = Depends(verify_token)):
     """Удалить комнату (только для создателя)"""
-    # Получаем сессию текущего пользователя
-    session_token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    session = await redis_manager.get_user_session(session_token)
+    # Получаем сессию текущего пользователя через JWT
+    session = await redis_manager.get_user_session(user_id)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
     
@@ -448,10 +585,10 @@ async def delete_room(room_id: str, request: Request):
     return {"message": "Room deleted"}
 
 @app.get("/api/user/rooms")
-async def get_user_rooms(request: Request):
+@limiter.limit("30/minute")
+async def get_user_rooms(request: Request, user_id: str = Depends(verify_token)):
     """Получить комнаты пользователя"""
-    session_token = request.headers.get("Authorization", "").replace("Bearer ", "")
-    session = await redis_manager.get_user_session(session_token)
+    session = await redis_manager.get_user_session(user_id)
     if not session:
         raise HTTPException(status_code=401, detail="Invalid session")
     
@@ -466,18 +603,48 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     logger.info(f"WebSocket подключение: комната {room_id}, пользователь {user_id}")
     await websocket.accept()
     
-    # Проверяем, что пользователь является участником комнаты
-    if not await redis_manager.is_participant(room_id, user_id):
-        await websocket.close(code=4003, reason="Not a participant")
+    # Проверяем, что комната существует
+    room_data = await redis_manager.get_room(room_id)
+    if not room_data:
+        await websocket.close(code=4004, reason="Room not found")
         return
+    
+    # Добавляем пользователя в комнату, если его там нет
+    if not await redis_manager.is_participant(room_id, user_id):
+        await redis_manager.add_participant(room_id, {"user_id": user_id, "status": "connected"})
+        logger.info(f"✅ Пользователь {user_id} добавлен в комнату {room_id}")
     
     if room_id not in active_connections:
         active_connections[room_id] = []
     
+    if room_id not in user_connections:
+        user_connections[room_id] = {}
+    
     active_connections[room_id].append(websocket)
+    user_connections[room_id][user_id] = websocket
     
     # Добавляем в активные соединения Redis
     await redis_manager.add_active_connection(room_id, user_id, {"status": "connected"})
+    
+    # Получаем список участников и отправляем всем
+    participants = await redis_manager.get_participants(room_id)
+    logger.info(f"👥 Участники комнаты {room_id}: {[p.get('user_id', p.get('id', 'unknown')) for p in participants]}")
+    
+    # Уведомляем всех участников о присоединении нового пользователя
+    await broadcast_to_others(room_id, websocket, json.dumps({
+        "type": "user_joined",
+        "user": {
+            "id": user_id,
+            "name": f"Пользователь {user_id[:8]}",
+            "status": "connected"
+        }
+    }))
+    
+    # Отправляем текущему пользователю список всех участников
+    await websocket.send_text(json.dumps({
+        "type": "participants_update",
+        "participants": participants
+    }))
     
     try:
         while True:
@@ -485,10 +652,13 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
             message = json.loads(data)
             
             # Обрабатываем различные типы сообщений
-            if message["type"] == "speaking":
+            if message["type"] == "speaking_status":
                 await handle_speaking_status(room_id, user_id, message.get("is_speaking", False))
             elif message["type"] == "ping":
                 await websocket.send_text(json.dumps({"type": "pong"}))
+            elif message["type"] in ["webrtc_offer", "webrtc_answer", "webrtc_ice_candidate"]:
+                # Пересылаем WebRTC сообщения конкретному получателю
+                await forward_webrtc_message(room_id, user_id, message)
             else:
                 # Пересылаем сообщение другим участникам
                 await broadcast_to_others(room_id, websocket, data)
@@ -502,6 +672,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
                 active_connections[room_id].remove(websocket)
             if not active_connections[room_id]:
                 del active_connections[room_id]
+        
+        if room_id in user_connections:
+            if user_id in user_connections[room_id]:
+                del user_connections[room_id][user_id]
+            if not user_connections[room_id]:
+                del user_connections[room_id]
         
         # Удаляем из активных соединений Redis
         await redis_manager.remove_active_connection(room_id, user_id)
@@ -549,10 +725,30 @@ async def notify_creator_only(room_id: str, message: dict):
             except:
                 active_connections[room_id].remove(connection)
 
+async def forward_webrtc_message(room_id: str, sender_id: str, message: dict):
+    """Переслать WebRTC сообщение конкретному получателю"""
+    target_user_id = message.get("to")
+    if not target_user_id:
+        return
+    
+    # Находим соединение получателя
+    if room_id in user_connections and target_user_id in user_connections[room_id]:
+        try:
+            # Добавляем информацию об отправителе
+            message["from"] = sender_id
+            target_websocket = user_connections[room_id][target_user_id]
+            await target_websocket.send_text(json.dumps(message))
+            logger.info(f"WebRTC сообщение {message['type']} отправлено от {sender_id} к {target_user_id}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки WebRTC сообщения: {e}")
+            # Удаляем неработающее соединение
+            if room_id in user_connections and target_user_id in user_connections[room_id]:
+                del user_connections[room_id][target_user_id]
+
 async def handle_speaking_status(room_id: str, user_id: str, is_speaking: bool):
     """Обработать информацию о том, что пользователь говорит"""
     message = {
-        "type": "speaking",
+        "type": "speaking_status",
         "user_id": user_id,
         "is_speaking": is_speaking
     }
@@ -582,6 +778,50 @@ async def notify_creator_about_request(room_id: str, user: dict):
         "room_id": room_id
     }
     await notify_creator_only(room_id, message)
+
+async def cleanup_inactive_users():
+    """Очистка неактивных пользователей из комнат"""
+    current_time = time.time()
+    inactive_threshold = 300  # 5 минут
+    
+    for room_id in list(user_connections.keys()):
+        inactive_users = []
+        
+        for user_id, websocket in user_connections[room_id].items():
+            try:
+                # Проверяем соединение
+                await websocket.ping()
+            except:
+                # Соединение неактивно
+                inactive_users.append(user_id)
+        
+        # Удаляем неактивных пользователей
+        for user_id in inactive_users:
+            logger.info(f"Удаляем неактивного пользователя {user_id} из комнаты {room_id}")
+            
+            # Удаляем из user_connections
+            if room_id in user_connections and user_id in user_connections[room_id]:
+                del user_connections[room_id][user_id]
+            
+            # Удаляем из active_connections
+            if room_id in active_connections:
+                # Находим и удаляем WebSocket
+                for i, ws in enumerate(active_connections[room_id]):
+                    if ws == user_connections[room_id].get(user_id):
+                        active_connections[room_id].pop(i)
+                        break
+                
+                # Если комната пуста, удаляем её
+                if not active_connections[room_id]:
+                    del active_connections[room_id]
+                    if room_id in user_connections:
+                        del user_connections[room_id]
+            
+            # Уведомляем остальных участников
+            await notify_user_left(room_id, user_id)
+            
+            # Удаляем из Redis
+            await redis_manager.remove_active_connection(room_id, user_id)
 
 async def notify_user_approved(room_id: str, user: dict):
     """Уведомить пользователя об одобрении"""
@@ -632,7 +872,32 @@ async def startup_event():
 # Статические файлы
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# Запуск периодической очистки неактивных пользователей
+import asyncio
+import threading
+
+async def cleanup_task():
+    """Задача периодической очистки неактивных пользователей"""
+    while True:
+        try:
+            await cleanup_inactive_users()
+            await asyncio.sleep(60)  # Проверяем каждую минуту
+        except Exception as e:
+            logger.error(f"Ошибка в задаче очистки: {e}")
+            await asyncio.sleep(60)
+
+def run_cleanup_task():
+    """Запуск задачи очистки в отдельном потоке"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(cleanup_task())
+
 if __name__ == "__main__":
     import uvicorn
+    
+    # Запускаем задачу очистки в отдельном потоке
+    cleanup_thread = threading.Thread(target=run_cleanup_task, daemon=True)
+    cleanup_thread.start()
+    
     logger.info("Запуск сервера SecureVoice v2 на порту 8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

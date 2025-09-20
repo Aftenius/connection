@@ -4,18 +4,34 @@
 
 ## 🚀 Быстрый старт
 
-### Development
+### 🐳 Docker (Рекомендуется)
+
 ```bash
 git clone <your-repo>
 cd securevoice
-docker-compose up --build
+
+# Development
+./start-docker.sh
+
+# Production
+./docker-prod.sh
 ```
 
-### Production
+### 📱 Без Docker
+
 ```bash
-git clone <your-repo>
-cd securevoice
-docker-compose -f docker-compose.prod.yml up --build -d
+# Backend
+cd server
+pip install -r requirements.txt
+python main.py
+
+# Frontend
+cd client
+npm install
+npm start
+
+# Redis
+redis-server
 ```
 
 ## 🌐 Доступ
@@ -25,9 +41,16 @@ docker-compose -f docker-compose.prod.yml up --build -d
 
 ## 🔧 Конфигурация
 
+### Docker (автоматическая настройка)
+- Файл `.env` создается автоматически при первом запуске
+- Для production отредактируйте `.env.production`
+
+### Ручная настройка
 1. Скопируйте `.env.example` в `.env`
 2. Измените `REACT_APP_API_URL` для production
 3. Настройте SSL сертификаты в `./ssl/`
+
+📖 **Подробная документация**: [DOCKER-README.md](./DOCKER-README.md)
 
 ## 📊 Архитектура
 

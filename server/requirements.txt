@@ -5,3 +5,8 @@ pydantic==2.5.0
 python-multipart==0.0.6
 redis==5.0.1
 aioredis==2.0.1
+PyJWT==2.8.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+slowapi==0.1.9
+python-jose==3.3.0

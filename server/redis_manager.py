@@ -38,17 +38,24 @@ class RedisManager:
     async def find_session_by_stable_id(self, stable_user_id: str) -> List[dict]:
         """Найти сессии по стабильному ID пользователя"""
         sessions = []
-        session_keys = await self.redis.keys("session:*")
+        try:
+            session_keys = await self.redis.keys("session:*")
+        except Exception:
+            # Redis недоступен — не валим 500, возвращаем пустой список
+            return []
         
         for key in session_keys:
-            session_data = await self.redis.get(key)
-            if session_data:
-                data = json.loads(session_data)
-                if data.get('stable_user_id') == stable_user_id:
-                    sessions.append({
-                        'session_token': key.replace('session:', ''),
-                        'session_data': data
-                    })
+            try:
+                session_data = await self.redis.get(key)
+                if session_data:
+                    data = json.loads(session_data)
+                    if data.get('stable_user_id') == stable_user_id:
+                        sessions.append({
+                            'session_token': key.replace('session:', ''),
+                            'session_data': data
+                        })
+            except Exception:
+                continue
         
         return sessions
     

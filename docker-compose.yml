@@ -3,13 +3,71 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     networks:
       - securevoice-network
     restart: unless-stopped
     command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Backend сервер
+  server:
+    build: 
+      context: ./server
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "${SERVER_PORT:-8000}:8000"
+    volumes:
+      - ./server:/app
+      - ./server/logs:/app/logs
+      - server_data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HOST=0.0.0.0
+      - PORT=8000
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-secure-production-jwt-key-change-this}
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - securevoice-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend клиент
+  client:
+    build: 
+      context: ./client
+      dockerfile: Dockerfile
+      target: production
+    ports:
+      - "${CLIENT_PORT:-3000}:3000"
+    environment:
+      - REACT_APP_API_URL=https://app.webnoir.ru
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - securevoice-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   # Nginx reverse proxy
   nginx:
@@ -18,50 +76,36 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/nginx-with-ssl.conf:/etc/nginx/nginx.conf
       - ./nginx/conf.d:/etc/nginx/conf.d
+      - nginx_logs:/var/log/nginx
+      - certbot_www:/var/www/certbot
+      - /etc/letsencrypt:/etc/letsencrypt:ro
     depends_on:
-      - server
-      - client
+      server:
+        condition: service_healthy
+      client:
+        condition: service_healthy
     networks:
       - securevoice-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # Backend сервер
-  server:
-    build: ./server
-    ports:
-      - "0.0.0.0:8000:8000"
+  # Certbot for SSL certificates
+  certbot:
+    image: certbot/certbot
     volumes:
-      - ./server:/app
-      - ./server/logs:/app/logs
-    environment:
-      - PYTHONUNBUFFERED=1
-      - HOST=0.0.0.0
-      - PORT=8000
-      - REDIS_URL=redis://redis:6379
+      - certbot_www:/var/www/certbot
+      - certbot_conf:/etc/letsencrypt
+    command: certonly --webroot --webroot-path=/var/www/certbot --email admin@webnoir.ru --agree-tos --no-eff-email -d app.webnoir.ru
     depends_on:
-      - redis
+      - nginx
     networks:
       - securevoice-network
-    restart: unless-stopped
-
-  # Frontend клиент
-  client:
-    build: ./client
-    ports:
-      - "0.0.0.0:3000:3000"
-    volumes:
-      - ./client:/app
-      - /app/node_modules
-    environment:
-      - REACT_APP_API_URL=http://192.168.127.134:8000
-      - CHOKIDAR_USEPOLLING=true
-    depends_on:
-      - server
-    networks:
-      - securevoice-network
-    restart: unless-stopped
 
 networks:
   securevoice-network:
@@ -69,3 +113,7 @@ networks:
 
 volumes:
   redis_data:
+  server_data:
+  nginx_logs:
+  certbot_www:
+  certbot_conf:

@@ -46,9 +46,37 @@ const AudioMeetingRoom = () => {
   const dataArray = useRef(null);
   const animationFrame = useRef(null);
   const audioElements = useRef(new Map());
-  
+
   const API_BASE_URL = process.env.REACT_APP_API_URL || window.location.origin;
   const sessionManager = new CookieSessionManager();
+
+  const normalizeParticipant = useCallback((participant, fallbackId) => {
+    if (!participant && !fallbackId) {
+      return null;
+    }
+
+    const data = { ...(participant || {}) };
+    const participantId = data.id || data.user_id || data.userId || fallbackId;
+
+    if (!participantId) {
+      return null;
+    }
+
+    data.id = participantId;
+    data.user_id = participantId;
+
+    if (!data.name) {
+      data.name = data.user_name || `Участник ${String(participantId).slice(0, 8)}`;
+    }
+
+    if (data.is_speaking === undefined) {
+      data.is_speaking = false;
+    } else {
+      data.is_speaking = Boolean(data.is_speaking);
+    }
+
+    return data;
+  }, []);
 
   // WebRTC конфигурация
   const rtcConfig = {
@@ -57,6 +85,12 @@ const AudioMeetingRoom = () => {
       { urls: 'stun:stun1.l.google.com:19302' }
     ]
   };
+
+  const sendWebRTCMessage = useCallback((message) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(message));
+    }
+  }, []);
 
   // WebSocket соединение
   const connectWebSocket = useCallback((roomId, userId) => {
@@ -78,38 +112,61 @@ const AudioMeetingRoom = () => {
         console.log('📨 WebSocket сообщение:', data);
         
         switch (data.type) {
-          case 'user_joined':
-            handleUserJoined(data.user);
+          case 'user_joined': {
+            const incomingUser = data.user || {
+              id: data.user_id,
+              user_id: data.user_id,
+              name: data.user_name,
+              status: data.status
+            };
+
+            const normalizedUser = normalizeParticipant(incomingUser, data.user_id);
+
+            if (!normalizedUser) {
+              console.warn('⚠️ Получено сообщение user_joined без корректных данных:', data);
+              break;
+            }
+
+            handleUserJoined(normalizedUser);
             break;
+          }
           case 'user_left':
             handleUserLeft(data.user_id);
             break;
           case 'participants_update':
             if (data.participants) {
               console.log('👥 Обновление участников:', data.participants);
-              setParticipants(data.participants);
-              
-              // Инициируем WebRTC соединения с новыми участниками
+              const normalizedParticipants = data.participants
+                .map(participant => normalizeParticipant(participant))
+                .filter(Boolean);
+              setParticipants(normalizedParticipants);
+
               setTimeout(() => {
-                data.participants.forEach(participant => {
-                  if (participant.id !== currentUser?.id && localStream && !peerConnections.current.has(participant.id)) {
-                    console.log('🔗 Инициируем WebRTC соединение с участником из списка:', participant.name);
-                    createPeerConnection(participant.id).then(pc => {
-                      if (pc && localStream) {
-                        pc.createOffer().then(offer => {
-                          pc.setLocalDescription(offer).then(() => {
-                            sendWebRTCMessage({
-                              type: 'webrtc_offer',
-                              to: participant.id,
-                              offer: offer
-                            });
-                          });
-                        }).catch(error => {
-                          console.error('❌ Ошибка создания offer для участника из списка:', error);
-                        });
-                      }
-                    });
+                normalizedParticipants.forEach(participant => {
+                  if (!participant?.id || participant.id === currentUser?.id || !localStream) {
+                    return;
                   }
+
+                  if (peerConnections.current.has(participant.id)) {
+                    return;
+                  }
+
+                  console.log('🔗 Инициируем WebRTC соединение с участником из списка:', participant.name);
+                  createPeerConnection(participant.id).then(pc => {
+                    if (pc && localStream) {
+                      pc.createOffer().then(offer => {
+                        pc.setLocalDescription(offer).then(() => {
+                          sendWebRTCMessage({
+                            type: 'webrtc_offer',
+                            to: participant.id,
+                            offer: offer
+                          });
+                        });
+                      }).catch(error => {
+                        console.error('❌ Ошибка создания offer для участника из списка:', error);
+                      });
+                    }
+                  });
                 });
               }, 500);
             }
@@ -123,7 +180,7 @@ const AudioMeetingRoom = () => {
           case 'webrtc_ice_candidate':
             handleWebRTCIceCandidate(data);
             break;
-          case 'speaking':
+          case 'speaking_status':
             console.log('🎤 Получен статус речи от:', data.user_id, 'Говорит:', data.is_speaking);
             handleSpeakingStatus(data);
             break;
@@ -144,31 +201,42 @@ const AudioMeetingRoom = () => {
     ws.onerror = (error) => {
       console.error('❌ Ошибка WebSocket:', error);
     };
-  }, [API_BASE_URL, currentUser?.id, localStream]);
+  }, [API_BASE_URL, currentUser?.id, handleUserJoined, handleWebRTCOffer, handleWebRTCAnswer, handleWebRTCIceCandidate, localStream, normalizeParticipant, sendWebRTCMessage]);
 
   // Обработка WebRTC событий
-  const handleUserJoined = (user) => {
-    console.log('👤 Пользователь присоединился:', user);
+  const handleUserJoined = useCallback((user) => {
+    const normalizedUser = normalizeParticipant(user);
+    if (!normalizedUser) {
+      console.warn('⚠️ Не удалось обработать данные участника при user_joined:', user);
+      return;
+    }
+
+    const participantId = normalizedUser.id;
+    const currentUserId = currentUser?.id;
+
+    console.log('👤 Пользователь присоединился:', normalizedUser);
     setParticipants(prev => {
-      const exists = prev.find(p => p.id === user.id);
+      const exists = prev.find(p => p.id === participantId);
       if (exists) {
-        console.log('⚠️ Пользователь уже в списке:', user.name);
-        return prev;
+        console.log('⚠️ Пользователь уже в списке, обновляем данные:', normalizedUser.name);
+        return prev.map(p => (p.id === participantId ? { ...p, ...normalizedUser } : p));
       }
-      console.log('✅ Добавляем участника:', user.name, 'Всего участников:', prev.length + 1);
-      return [...prev, user];
+      console.log('✅ Добавляем участника:', normalizedUser.name, 'Всего участников:', prev.length + 1);
+      return [...prev, normalizedUser];
     });
-    
-    // Создаем WebRTC соединение с новым пользователем
-    if (localStream && user.id !== currentUser?.id) {
-      createPeerConnection(user.id).then(pc => {
-        // Создаем offer для инициации соединения
+
+    if (!participantId || participantId === currentUserId) {
+      return;
+    }
+
+    if (localStream) {
+      createPeerConnection(participantId).then(pc => {
         if (pc && localStream) {
           pc.createOffer().then(offer => {
             pc.setLocalDescription(offer).then(() => {
               sendWebRTCMessage({
                 type: 'webrtc_offer',
-                to: user.id,
+                to: participantId,
                 offer: offer
               });
             });
@@ -178,7 +246,7 @@ const AudioMeetingRoom = () => {
         }
       });
     }
-  };
+  }, [createPeerConnection, currentUser, localStream, normalizeParticipant, sendWebRTCMessage]);
 
   const handleUserLeft = (userId) => {
     console.log('👋 Пользователь покинул:', userId);
@@ -272,8 +340,13 @@ const AudioMeetingRoom = () => {
 
   // Создание WebRTC соединения
   const createPeerConnection = useCallback(async (userId) => {
+    if (!userId) {
+      console.warn('⚠️ Невозможно создать WebRTC соединение: не указан идентификатор пользователя');
+      return null;
+    }
+
     console.log('🔗 Создаем WebRTC соединение с:', userId);
-    
+
     const pc = new RTCPeerConnection(rtcConfig);
     peerConnections.current.set(userId, pc);
 
@@ -331,13 +404,6 @@ const AudioMeetingRoom = () => {
 
     return pc;
   }, [localStream, isSpeakerOn]);
-
-  // Отправка WebRTC сообщений через WebSocket
-  const sendWebRTCMessage = useCallback((message) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(message));
-    }
-  }, []);
 
   // Отправка общих WebSocket сообщений
   const sendWebSocketMessage = useCallback((message) => {
@@ -413,7 +479,7 @@ const AudioMeetingRoom = () => {
       
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
         wsRef.current.send(JSON.stringify({
-          type: 'speaking',
+          type: 'speaking_status',
           user_id: currentUser?.id,
           is_speaking: currentlySpeaking
         }));
@@ -433,12 +499,18 @@ const AudioMeetingRoom = () => {
       
       // Добавляем текущего пользователя в список участников
       setParticipants(prev => {
-        const exists = prev.find(p => p.id === currentUser.id);
-        if (!exists) {
-          console.log('✅ Добавляем текущего пользователя в участники:', currentUser.name);
-          return [...prev, currentUser];
+        const normalizedCurrentUser = normalizeParticipant(currentUser, currentUser?.id);
+        if (!normalizedCurrentUser) {
+          console.warn('⚠️ Не удалось нормализовать текущего пользователя для аудио-комнаты');
+          return prev;
         }
-        return prev;
+
+        const exists = prev.find(p => p.id === normalizedCurrentUser.id);
+        if (!exists) {
+          console.log('✅ Добавляем текущего пользователя в участники:', normalizedCurrentUser.name);
+          return [...prev, normalizedCurrentUser];
+        }
+        return prev.map(p => (p.id === normalizedCurrentUser.id ? { ...p, ...normalizedCurrentUser } : p));
       });
       
       // Подключаемся к WebSocket
@@ -452,25 +524,33 @@ const AudioMeetingRoom = () => {
       
       // Инициируем WebRTC соединения с существующими участниками
       setTimeout(() => {
+        const currentUserId = currentUser?.id;
         participants.forEach(participant => {
-          if (participant.id !== currentUser.id && localStream) {
-            console.log('🔗 Инициируем WebRTC соединение с существующим участником:', participant.name);
-            createPeerConnection(participant.id).then(pc => {
-              if (pc && localStream) {
-                pc.createOffer().then(offer => {
-                  pc.setLocalDescription(offer).then(() => {
-                    sendWebRTCMessage({
-                      type: 'webrtc_offer',
-                      to: participant.id,
-                      offer: offer
-                    });
-                  });
-                }).catch(error => {
-                  console.error('❌ Ошибка создания offer для существующего участника:', error);
-                });
-              }
-            });
+          const participantId = participant?.id || participant?.user_id;
+          if (!participantId || participantId === currentUserId || !localStream) {
+            return;
           }
+
+          if (peerConnections.current.has(participantId)) {
+            return;
+          }
+
+          console.log('🔗 Инициируем WebRTC соединение с существующим участником:', participant.name);
+          createPeerConnection(participantId).then(pc => {
+            if (pc && localStream) {
+              pc.createOffer().then(offer => {
+                pc.setLocalDescription(offer).then(() => {
+                  sendWebRTCMessage({
+                    type: 'webrtc_offer',
+                    to: participantId,
+                    offer: offer
+                  });
+                });
+              }).catch(error => {
+                console.error('❌ Ошибка создания offer для существующего участника:', error);
+              });
+            }
+          });
         });
       }, 1000); // Задержка для стабилизации соединения
       
@@ -479,7 +559,7 @@ const AudioMeetingRoom = () => {
       alert('Ошибка присоединения к аудио-комнате: ' + error.message);
       navigate('/');
     }
-  }, [roomId, isInRoom, isAuthenticated, currentUser, navigate, getAudioStream, createPeerConnection, sendWebRTCMessage, participants, localStream]);
+  }, [roomId, isInRoom, isAuthenticated, currentUser, navigate, getAudioStream, createPeerConnection, sendWebRTCMessage, participants, localStream, normalizeParticipant]);
 
   // Начать аудио-звонок
   const startCall = useCallback(async () => {

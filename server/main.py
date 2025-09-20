@@ -609,10 +609,38 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
         await websocket.close(code=4004, reason="Room not found")
         return
     
-    # Добавляем пользователя в комнату, если его там нет
-    if not await redis_manager.is_participant(room_id, user_id):
-        await redis_manager.add_participant(room_id, {"user_id": user_id, "status": "connected"})
-        logger.info(f"✅ Пользователь {user_id} добавлен в комнату {room_id}")
+    existing_participants = await redis_manager.get_participants(room_id)
+    participant_data = None
+
+    for stored_participant in existing_participants:
+        normalized = normalize_participant(stored_participant)
+        if normalized and normalized["id"] == user_id:
+            participant_data = normalized
+            break
+
+    if not participant_data:
+        session = await redis_manager.get_user_session(user_id)
+        participant_data = normalize_participant({
+            "id": user_id,
+            "name": session.get("name") if session else None,
+            "is_creator": room_data.get("creator_id") == user_id,
+            "joined_at": time.time()
+        })
+    else:
+        if not participant_data.get("name"):
+            session = await redis_manager.get_user_session(user_id)
+            if session and session.get("name"):
+                participant_data["name"] = session["name"]
+
+    if not participant_data:
+        participant_data = normalize_participant({"id": user_id})
+
+    participant_data["status"] = "connected"
+    participant_data["last_connected_at"] = time.time()
+    participant_data["is_creator"] = participant_data.get("is_creator", room_data.get("creator_id") == user_id)
+
+    await redis_manager.add_participant(room_id, participant_data)
+    logger.info(f"✅ Участник {participant_data['id']} зарегистрирован в комнате {room_id}")
     
     if room_id not in active_connections:
         active_connections[room_id] = []
@@ -627,19 +655,21 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     await redis_manager.add_active_connection(room_id, user_id, {"status": "connected"})
     
     # Получаем список участников и отправляем всем
-    participants = await redis_manager.get_participants(room_id)
-    logger.info(f"👥 Участники комнаты {room_id}: {[p.get('user_id', p.get('id', 'unknown')) for p in participants]}")
-    
+    raw_participants = await redis_manager.get_participants(room_id)
+    participants = []
+    for stored_participant in raw_participants:
+        normalized = normalize_participant(stored_participant)
+        if normalized:
+            participants.append(normalized)
+
+    logger.info(f"👥 Участники комнаты {room_id}: {[p.get('id') for p in participants]}")
+
     # Уведомляем всех участников о присоединении нового пользователя
     await broadcast_to_others(room_id, websocket, json.dumps({
         "type": "user_joined",
-        "user": {
-            "id": user_id,
-            "name": f"Пользователь {user_id[:8]}",
-            "status": "connected"
-        }
+        "user": participant_data
     }))
-    
+
     # Отправляем текущему пользователю список всех участников
     await websocket.send_text(json.dumps({
         "type": "participants_update",
@@ -707,6 +737,25 @@ async def broadcast_to_all(room_id: str, message: dict):
             except:
                 active_connections[room_id].remove(connection)
 
+def normalize_participant(participant: Optional[dict], fallback_id: Optional[str] = None) -> Optional[dict]:
+    """Привести данные участника к единому формату"""
+    if not participant and not fallback_id:
+        return None
+
+    data = (participant or {}).copy()
+    participant_id = data.get("id") or data.get("user_id") or fallback_id
+
+    if not participant_id:
+        return None
+
+    data["id"] = participant_id
+    data["user_id"] = participant_id
+
+    if not data.get("name"):
+        data["name"] = f"Пользователь {participant_id[:8]}"
+
+    return data
+
 async def notify_creator_only(room_id: str, message: dict):
     """Отправить сообщение только создателю комнаты"""
     room_data = await redis_manager.get_room(room_id)
@@ -756,9 +805,13 @@ async def handle_speaking_status(room_id: str, user_id: str, is_speaking: bool):
 
 async def notify_user_joined(room_id: str, user: dict):
     """Уведомить всех участников о присоединении нового пользователя"""
+    participant = normalize_participant(user)
+    if not participant:
+        return
+
     message = {
         "type": "user_joined",
-        "user": user
+        "user": participant
     }
     await broadcast_to_all(room_id, message)
 

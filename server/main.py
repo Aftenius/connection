@@ -21,6 +21,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from redis_manager import redis_manager
+from starlette.websockets import WebSocketState
 
 # Настройка логирования
 os.makedirs('logs', exist_ok=True)
@@ -608,11 +609,43 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     if not room_data:
         await websocket.close(code=4004, reason="Room not found")
         return
-    
-    # Добавляем пользователя в комнату, если его там нет
-    if not await redis_manager.is_participant(room_id, user_id):
-        await redis_manager.add_participant(room_id, {"user_id": user_id, "status": "connected"})
-        logger.info(f"✅ Пользователь {user_id} добавлен в комнату {room_id}")
+
+    participant_registered = False
+    connection_registered = False
+
+    existing_participants = await redis_manager.get_participants(room_id)
+    participant_data = None
+
+    for stored_participant in existing_participants:
+        normalized = normalize_participant(stored_participant)
+        if normalized and normalized["id"] == user_id:
+            participant_data = normalized
+            break
+
+    if not participant_data:
+        session = await redis_manager.get_user_session(user_id)
+        participant_data = normalize_participant({
+            "id": user_id,
+            "name": session.get("name") if session else None,
+            "is_creator": room_data.get("creator_id") == user_id,
+            "joined_at": time.time()
+        })
+    else:
+        if not participant_data.get("name"):
+            session = await redis_manager.get_user_session(user_id)
+            if session and session.get("name"):
+                participant_data["name"] = session["name"]
+
+    if not participant_data:
+        participant_data = normalize_participant({"id": user_id})
+
+    participant_data["status"] = "connected"
+    participant_data["last_connected_at"] = time.time()
+    participant_data["is_creator"] = participant_data.get("is_creator", room_data.get("creator_id") == user_id)
+
+    await redis_manager.add_participant(room_id, participant_data)
+    participant_registered = True
+    logger.info(f"✅ Участник {participant_data['id']} зарегистрирован в комнате {room_id}")
     
     if room_id not in active_connections:
         active_connections[room_id] = []
@@ -622,24 +655,27 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
     
     active_connections[room_id].append(websocket)
     user_connections[room_id][user_id] = websocket
+    connection_registered = True
     
     # Добавляем в активные соединения Redis
     await redis_manager.add_active_connection(room_id, user_id, {"status": "connected"})
     
     # Получаем список участников и отправляем всем
-    participants = await redis_manager.get_participants(room_id)
-    logger.info(f"👥 Участники комнаты {room_id}: {[p.get('user_id', p.get('id', 'unknown')) for p in participants]}")
-    
+    raw_participants = await redis_manager.get_participants(room_id)
+    participants = []
+    for stored_participant in raw_participants:
+        normalized = normalize_participant(stored_participant)
+        if normalized:
+            participants.append(normalized)
+
+    logger.info(f"👥 Участники комнаты {room_id}: {[p.get('id') for p in participants]}")
+
     # Уведомляем всех участников о присоединении нового пользователя
     await broadcast_to_others(room_id, websocket, json.dumps({
         "type": "user_joined",
-        "user": {
-            "id": user_id,
-            "name": f"Пользователь {user_id[:8]}",
-            "status": "connected"
-        }
+        "user": participant_data
     }))
-    
+
     # Отправляем текущему пользователю список всех участников
     await websocket.send_text(json.dumps({
         "type": "participants_update",
@@ -665,25 +701,31 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, user_id: str):
                 
     except WebSocketDisconnect:
         logger.info(f"WebSocket отключение: пользователь {user_id} покинул комнату {room_id}")
-        
-        # Удаляем соединение
-        if room_id in active_connections:
-            if websocket in active_connections[room_id]:
+    except Exception as exc:
+        logger.exception(
+            "Ошибка обработки WebSocket соединения %s в комнате %s",
+            user_id,
+            room_id,
+            exc_info=exc
+        )
+    finally:
+        if connection_registered:
+            if room_id in active_connections and websocket in active_connections[room_id]:
                 active_connections[room_id].remove(websocket)
-            if not active_connections[room_id]:
-                del active_connections[room_id]
-        
-        if room_id in user_connections:
-            if user_id in user_connections[room_id]:
+                if not active_connections[room_id]:
+                    del active_connections[room_id]
+
+            if room_id in user_connections and user_id in user_connections[room_id]:
                 del user_connections[room_id][user_id]
-            if not user_connections[room_id]:
-                del user_connections[room_id]
-        
-        # Удаляем из активных соединений Redis
-        await redis_manager.remove_active_connection(room_id, user_id)
-        
-        # Уведомляем остальных участников
-        await notify_user_left(room_id, user_id)
+                if not user_connections[room_id]:
+                    del user_connections[room_id]
+
+            await redis_manager.remove_active_connection(room_id, user_id)
+
+        if participant_registered:
+            await redis_manager.remove_participant(room_id, user_id)
+            await notify_user_left(room_id, user_id)
+            await send_participants_update(room_id)
 
 # === HELPER FUNCTIONS ===
 
@@ -706,6 +748,40 @@ async def broadcast_to_all(room_id: str, message: dict):
                 await connection.send_text(message_str)
             except:
                 active_connections[room_id].remove(connection)
+
+async def send_participants_update(room_id: str):
+    """Рассылает актуальный список участников всем подключенным клиентам"""
+    raw_participants = await redis_manager.get_participants(room_id)
+    participants: List[dict] = []
+
+    for stored_participant in raw_participants:
+        normalized = normalize_participant(stored_participant)
+        if normalized:
+            participants.append(normalized)
+
+    await broadcast_to_all(room_id, {
+        "type": "participants_update",
+        "participants": participants
+    })
+
+def normalize_participant(participant: Optional[dict], fallback_id: Optional[str] = None) -> Optional[dict]:
+    """Привести данные участника к единому формату"""
+    if not participant and not fallback_id:
+        return None
+
+    data = (participant or {}).copy()
+    participant_id = data.get("id") or data.get("user_id") or fallback_id
+
+    if not participant_id:
+        return None
+
+    data["id"] = participant_id
+    data["user_id"] = participant_id
+
+    if not data.get("name"):
+        data["name"] = f"Пользователь {participant_id[:8]}"
+
+    return data
 
 async def notify_creator_only(room_id: str, message: dict):
     """Отправить сообщение только создателю комнаты"""
@@ -756,9 +832,13 @@ async def handle_speaking_status(room_id: str, user_id: str, is_speaking: bool):
 
 async def notify_user_joined(room_id: str, user: dict):
     """Уведомить всех участников о присоединении нового пользователя"""
+    participant = normalize_participant(user)
+    if not participant:
+        return
+
     message = {
         "type": "user_joined",
-        "user": user
+        "user": participant
     }
     await broadcast_to_all(room_id, message)
 
@@ -781,47 +861,40 @@ async def notify_creator_about_request(room_id: str, user: dict):
 
 async def cleanup_inactive_users():
     """Очистка неактивных пользователей из комнат"""
-    current_time = time.time()
-    inactive_threshold = 300  # 5 минут
-    
-    for room_id in list(user_connections.keys()):
-        inactive_users = []
-        
-        for user_id, websocket in user_connections[room_id].items():
-            try:
-                # Проверяем соединение
-                await websocket.ping()
-            except:
-                # Соединение неактивно
-                inactive_users.append(user_id)
-        
-        # Удаляем неактивных пользователей
-        for user_id in inactive_users:
+    for room_id, connections in list(user_connections.items()):
+        stale_entries = []
+
+        for user_id, websocket in list(connections.items()):
+            if websocket.client_state != WebSocketState.CONNECTED:
+                stale_entries.append((user_id, websocket))
+
+        if not stale_entries:
+            continue
+
+        for user_id, websocket in stale_entries:
             logger.info(f"Удаляем неактивного пользователя {user_id} из комнаты {room_id}")
-            
-            # Удаляем из user_connections
-            if room_id in user_connections and user_id in user_connections[room_id]:
-                del user_connections[room_id][user_id]
-            
-            # Удаляем из active_connections
+
+            stored_ws = None
+            room_connections = user_connections.get(room_id)
+            if room_connections and user_id in room_connections:
+                stored_ws = room_connections.pop(user_id)
+                if not room_connections:
+                    user_connections.pop(room_id, None)
+
+            target_ws = stored_ws or websocket
+
             if room_id in active_connections:
-                # Находим и удаляем WebSocket
-                for i, ws in enumerate(active_connections[room_id]):
-                    if ws == user_connections[room_id].get(user_id):
-                        active_connections[room_id].pop(i)
-                        break
-                
-                # Если комната пуста, удаляем её
+                active_connections[room_id] = [
+                    ws for ws in active_connections[room_id] if ws is not target_ws
+                ]
                 if not active_connections[room_id]:
                     del active_connections[room_id]
-                    if room_id in user_connections:
-                        del user_connections[room_id]
-            
-            # Уведомляем остальных участников
+
             await notify_user_left(room_id, user_id)
-            
-            # Удаляем из Redis
             await redis_manager.remove_active_connection(room_id, user_id)
+            await redis_manager.remove_participant(room_id, user_id)
+
+        await send_participants_update(room_id)
 
 async def notify_user_approved(room_id: str, user: dict):
     """Уведомить пользователя об одобрении"""
@@ -853,51 +926,42 @@ async def notify_room_deleted(room_id: str):
 
 # === ПЕРИОДИЧЕСКИЕ ЗАДАЧИ ===
 
-async def cleanup_task():
+async def cleanup_rooms_task():
     """Периодическая очистка истекших комнат"""
     while True:
         try:
             await redis_manager.cleanup_expired_rooms()
             await asyncio.sleep(3600)  # Каждый час
         except Exception as e:
-            logger.error(f"Ошибка в cleanup_task: {e}")
+            logger.error(f"Ошибка в cleanup_rooms_task: {e}")
             await asyncio.sleep(60)
 
-@app.on_event("startup")
-async def startup_event():
-    """Запуск фоновых задач"""
-    asyncio.create_task(cleanup_task())
-    logger.info("SecureVoice Server v2 запущен")
 
-# Статические файлы
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Запуск периодической очистки неактивных пользователей
-import asyncio
-import threading
-
-async def cleanup_task():
+async def cleanup_inactive_users_task():
     """Задача периодической очистки неактивных пользователей"""
     while True:
         try:
             await cleanup_inactive_users()
-            await asyncio.sleep(60)  # Проверяем каждую минуту
+            await asyncio.sleep(60)
         except Exception as e:
-            logger.error(f"Ошибка в задаче очистки: {e}")
+            logger.error(f"Ошибка в cleanup_inactive_users_task: {e}")
             await asyncio.sleep(60)
 
-def run_cleanup_task():
-    """Запуск задачи очистки в отдельном потоке"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(cleanup_task())
+
+@app.on_event("startup")
+async def startup_event():
+    """Запуск фоновых задач"""
+    asyncio.create_task(cleanup_rooms_task())
+    asyncio.create_task(cleanup_inactive_users_task())
+    logger.info("SecureVoice Server v2 запущен")
+
+
+# Статические файлы
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # Запускаем задачу очистки в отдельном потоке
-    cleanup_thread = threading.Thread(target=run_cleanup_task, daemon=True)
-    cleanup_thread.start()
-    
+
     logger.info("Запуск сервера SecureVoice v2 на порту 8000")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

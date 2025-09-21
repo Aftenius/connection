@@ -349,6 +349,33 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
     });
   }, []);
 
+  const negotiateWithPeer = useCallback(
+    async (peerId, pc) => {
+      if (!peerId || !pc || pc.connectionState === 'closed' || !localStream) {
+        return;
+      }
+
+      try {
+        makingOfferRef.current.add(peerId);
+        const offer = await pc.createOffer();
+        if (pc.connectionState === 'closed') {
+          return;
+        }
+        await pc.setLocalDescription(offer);
+        sendSignal({
+          type: 'webrtc_offer',
+          to: peerId,
+          offer
+        });
+      } catch (offerError) {
+        console.error('useVoiceRoom: ошибка создания offer', offerError);
+      } finally {
+        makingOfferRef.current.delete(peerId);
+      }
+    },
+    [localStream, sendSignal]
+  );
+
   const ensurePeer = useCallback(
     (peerId) => {
       if (!peerId || peerId === currentUserId) {
@@ -369,8 +396,6 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
 
       entry = { pc, polite };
       peersRef.current.set(peerId, entry);
-
-      attachLocalTracks(pc);
 
       pc.onicecandidate = (event) => {
         if (event.candidate) {
@@ -408,29 +433,26 @@ export const useVoiceRoom = ({ roomId, currentUser, isAuthenticated }) => {
       };
 
       pc.onnegotiationneeded = async () => {
-        if (!localStream) {
-          return;
-        }
-
-        try {
-          makingOfferRef.current.add(peerId);
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          sendSignal({
-            type: 'webrtc_offer',
-            to: peerId,
-            offer
-          });
-        } catch (offerError) {
-          console.error('useVoiceRoom: ошибка создания offer', offerError);
-        } finally {
-          makingOfferRef.current.delete(peerId);
-        }
+        await negotiateWithPeer(peerId, pc);
       };
+
+      attachLocalTracks(pc);
+
+      Promise.resolve().then(() => {
+        const storedEntry = peersRef.current.get(peerId);
+        if (
+          storedEntry?.pc === pc &&
+          pc.connectionState !== 'closed' &&
+          pc.signalingState === 'stable' &&
+          !makingOfferRef.current.has(peerId)
+        ) {
+          negotiateWithPeer(peerId, pc);
+        }
+      });
 
       return entry;
     },
-    [attachLocalTracks, currentUserId, localStream, sendSignal, teardownPeer]
+    [attachLocalTracks, currentUserId, negotiateWithPeer, teardownPeer]
   );
 
   const flushCandidateQueue = useCallback(async (peerId) => {
